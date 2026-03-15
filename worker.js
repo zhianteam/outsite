@@ -49,24 +49,32 @@ async function handleRequest(request) {
   const responseClone = response.clone()
   const contentType = response.headers.get('content-type')
 
+  // 移除限制性响应头
+  const newResponseHeaders = new Headers(response.headers)
+  newResponseHeaders.delete('Content-Security-Policy')
+  newResponseHeaders.delete('Content-Security-Policy-Report-Only')
+  newResponseHeaders.delete('X-Frame-Options')
+  newResponseHeaders.set('Access-Control-Allow-Origin', '*')
+
   // 如果是 HTML 响应，对内容进行修改
   if (contentType && contentType.includes('text/html')) {
     const html = await responseClone.text()
     // 修改所有以 http:// 或 https:// 开头的链接，以及所有以 / 开头的相对链接
-    // OpenWeb Proxy核心JS钩子（精简版，防止无限重定向）
+    // OpenWeb Proxy核心JS钩子（增强版）
     const proxyInjection = `
     (function(){
       // 防止重复注入
       if(window.__PROXY_INJECTED__) return; window.__PROXY_INJECTED__=true;
       // 防止无限重定向
       if(window.__PROXY_REDIRECT_COUNT__===undefined) window.__PROXY_REDIRECT_COUNT__=0;
-      if(window.__PROXY_REDIRECT_COUNT__>5) { alert('Too many proxy redirects!'); return; }
+      if(window.__PROXY_REDIRECT_COUNT__>5) { console.error('Too many proxy redirects!'); return; }
       window.__PROXY_REDIRECT_COUNT__++;
-      // 动态劫持fetch、XHR、open、setAttribute、appendChild、location、history等
+      
+      // URL 转换核心函数
       function changeURL(url){
         try{
           if(!url||typeof url!=='string') return url;
-          if(url.startsWith('data:')||url.startsWith('mailto:')||url.startsWith('javascript:')||url.startsWith('chrome')||url.startsWith('edge')) return url;
+          if(url.startsWith('data:')||url.startsWith('mailto:')||url.startsWith('javascript:')||url.startsWith('chrome')||url.startsWith('edge')||url.startsWith('about:')) return url;
           if(url.startsWith(window.location.origin+'/')) return url;
           if(url.startsWith('//')) url = window.location.protocol + url;
           let u = new URL(url, window.location.href);
@@ -77,6 +85,16 @@ async function handleRequest(request) {
         }catch(e){}
         return url;
       }
+      
+      // 处理 HTML 字符串中的 URL
+      function processHTML(html){
+        if(typeof html!=='string') return html;
+        return html
+          .replace(/(href|src|action)=["']https?:\\/\\/([^"'\\/]+)([^"']*)["']/gi, (m,a,h,p)=>\`\${a}="\${window.location.origin}/\${h}\${p}"\`)
+          .replace(/(href|src|action)=["']\\/\\/([^"'\\/]+)([^"']*)["']/gi, (m,a,h,p)=>\`\${a}="\${window.location.origin}/\${h}\${p}"\`)
+          .replace(/url\\(["']?https?:\\/\\/([^"')\\/]+)([^"')]*)["']?\\)/gi, (m,h,p)=>\`url("\${window.location.origin}/\${h}\${p}")\`);
+      }
+      
       // fetch
       const origFetch = window.fetch;
       window.fetch = function(input, init){
@@ -88,42 +106,90 @@ async function handleRequest(request) {
           return origFetch(newReq, init);
         }
       };
+      
       // XHR
       const origOpen = XMLHttpRequest.prototype.open;
       XMLHttpRequest.prototype.open = function(method, url, ...args){
         url = changeURL(url);
         return origOpen.call(this, method, url, ...args);
       };
+      
       // window.open
       const origWinOpen = window.open;
       window.open = function(url, ...args){
         url = changeURL(url);
         return origWinOpen.call(window, url, ...args);
       };
+      
       // setAttribute
       const origSetAttr = HTMLElement.prototype.setAttribute;
       HTMLElement.prototype.setAttribute = function(name, value){
-        if(name==='src'||name==='href') value = changeURL(value);
+        if((name==='src'||name==='href'||name==='action') && typeof value==='string') value = changeURL(value);
         return origSetAttr.call(this, name, value);
       };
+      
       // appendChild
       const origAppendChild = Node.prototype.appendChild;
       Node.prototype.appendChild = function(child){
         try{
           if(child.src) child.src = changeURL(child.src);
           if(child.href) child.href = changeURL(child.href);
-        }catch{};
+          if(child.action) child.action = changeURL(child.action);
+        }catch{}
         return origAppendChild.call(this, child);
       };
+      
+      // insertBefore
+      const origInsertBefore = Node.prototype.insertBefore;
+      Node.prototype.insertBefore = function(newNode, refNode){
+        try{
+          if(newNode.src) newNode.src = changeURL(newNode.src);
+          if(newNode.href) newNode.href = changeURL(newNode.href);
+          if(newNode.action) newNode.action = changeURL(newNode.action);
+        }catch{}
+        return origInsertBefore.call(this, newNode, refNode);
+      };
+      
+      // replaceChild
+      const origReplaceChild = Node.prototype.replaceChild;
+      Node.prototype.replaceChild = function(newChild, oldChild){
+        try{
+          if(newChild.src) newChild.src = changeURL(newChild.src);
+          if(newChild.href) newChild.href = changeURL(newChild.href);
+          if(newChild.action) newChild.action = changeURL(newChild.action);
+        }catch{}
+        return origReplaceChild.call(this, newChild, oldChild);
+      };
+      
+      // innerHTML / outerHTML
+      const origInnerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+      Object.defineProperty(Element.prototype, 'innerHTML', {
+        set: function(html){ origInnerHTMLDesc.set.call(this, processHTML(html)); },
+        get: function(){ return origInnerHTMLDesc.get.call(this); }
+      });
+      const origOuterHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
+      Object.defineProperty(Element.prototype, 'outerHTML', {
+        set: function(html){ origOuterHTMLDesc.set.call(this, processHTML(html)); },
+        get: function(){ return origOuterHTMLDesc.get.call(this); }
+      });
+      
+      // document.write / writeln
+      const origWrite = document.write;
+      document.write = function(html){ origWrite.call(document, processHTML(html)); };
+      const origWriteln = document.writeln;
+      document.writeln = function(html){ origWriteln.call(document, processHTML(html)); };
+      
       // location.assign/replace/href
       const origAssign = window.location.assign;
       window.location.assign = function(url){ origAssign.call(window.location, changeURL(url)); };
       const origReplace = window.location.replace;
       window.location.replace = function(url){ origReplace.call(window.location, changeURL(url)); };
+      const origHrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
       Object.defineProperty(window.location, 'href', {
-        set: function(url){ origAssign.call(window.location, changeURL(url)); },
-        get: function(){ return origAssign.toString(); }
+        set: function(url){ origHrefDesc.set.call(window.location, changeURL(url)); },
+        get: function(){ return origHrefDesc.get.call(window.location); }
       });
+      
       // history
       const origPush = history.pushState;
       history.pushState = function(state, title, url){
@@ -135,52 +201,155 @@ async function handleRequest(request) {
         if(url) url = changeURL(url);
         return origReplaceState.call(history, state, title, url);
       };
+      
+      // MutationObserver 监听 DOM 变化
+      const observer = new MutationObserver(mutations => {
+        mutations.forEach(mutation => {
+          mutation.addedNodes.forEach(node => {
+            if(node.nodeType === 1){
+              try{
+                if(node.src) node.src = changeURL(node.src);
+                if(node.href) node.href = changeURL(node.href);
+                if(node.action) node.action = changeURL(node.action);
+                // 递归处理子元素
+                node.querySelectorAll('[src],[href],[action]').forEach(el => {
+                  if(el.src) el.src = changeURL(el.src);
+                  if(el.href) el.href = changeURL(el.href);
+                  if(el.action) el.action = changeURL(el.action);
+                });
+              }catch{}
+            }
+          });
+        });
+      });
+      observer.observe(document.documentElement, {childList: true, subtree: true});
     })();
     `;
     const modifiedHtml = html
-      // 1. 绝对链接转镜像
-      .replace(/(href|src|action)="https?:\/\/([^\"/]+)([^\"]*)"/g, (match, attr, host, path) => {
-        const mirrorUrl = `https://${url.host}/${host}${path}`
-        return `${attr}="${mirrorUrl}"`
+      // 1. 双引号属性：绝对链接
+      .replace(/(href|src|action|data)="https?:\/\/([^\"/]+)([^\"]*)"/gi, (match, attr, host, path) => {
+        return `${attr}="https://${url.host}/${host}${path}"`
       })
-      // 1.1 协议相对链接 //host/path 转镜像
-      .replace(/(href|src|action)="\/\/([^\"/]+)([^\"]*)"/g, (match, attr, host, path) => {
-        const mirrorUrl = `https://${url.host}/${host}${path}`
-        return `${attr}="${mirrorUrl}"`
+      // 2. 单引号属性：绝对链接
+      .replace(/(href|src|action|data)='https?:\/\/([^'\/]+)([^']*)'/gi, (match, attr, host, path) => {
+        return `${attr}='https://${url.host}/${host}${path}'`
       })
-      // 2. url("https://...") 样式转镜像
-      .replace(/url\("https?:\/\/([^\"/]+)([^\"]*)"\)/g, (match, host, path) => {
-        const mirrorUrl = `https://${url.host}/${host}${path}`
-        return `url("${mirrorUrl}")`
+      // 3. 无引号属性：绝对链接（不规范但有些网站这么写）
+      .replace(/(href|src|action|data)=https?:\/\/([^\s>]+)/gi, (match, attr, hostpath) => {
+        return `${attr}="https://${url.host}/${hostpath}"`
       })
-      // 2.1 url("//host/path") 样式转镜像
-      .replace(/url\("\/\/([^\"/]+)([^\"]*)"\)/g, (match, host, path) => {
-        const mirrorUrl = `https://${url.host}/${host}${path}`
-        return `url("${mirrorUrl}")`
+      // 4. 协议相对链接 //host/path（双引号）
+      .replace(/(href|src|action|data)="\/\/([^\"/]+)([^\"]*)"/gi, (match, attr, host, path) => {
+        return `${attr}="https://${url.host}/${host}${path}"`
       })
-      // 3. 以 / 开头的相对链接补全为 /当前域名/xxx
-      .replace(/(href|src|action)="\/(?!\/)([^\"]*)"/g, (match, attr, path) => {
-        // 只补全不是 // 开头的
+      // 5. 协议相对链接（单引号）
+      .replace(/(href|src|action|data)='\/\/([^'\/]+)([^']*)'/gi, (match, attr, host, path) => {
+        return `${attr}='https://${url.host}/${host}${path}'`
+      })
+      // 6. CSS url() 双引号
+      .replace(/url\("https?:\/\/([^\"/]+)([^\"]*)"\)/gi, (match, host, path) => {
+        return `url("https://${url.host}/${host}${path}")`
+      })
+      // 7. CSS url() 单引号
+      .replace(/url\('https?:\/\/([^'\/]+)([^']*)'\)/gi, (match, host, path) => {
+        return `url('https://${url.host}/${host}${path}')`
+      })
+      // 8. CSS url() 无引号
+      .replace(/url\(https?:\/\/([^\s)]+)\)/gi, (match, hostpath) => {
+        return `url("https://${url.host}/${hostpath}")`
+      })
+      // 9. CSS url() 协议相对
+      .replace(/url\(["']?\/\/([^\s)"']+)["']?\)/gi, (match, hostpath) => {
+        return `url("https://${url.host}/${hostpath}")`
+      })
+      // 10. CSS @import
+      .replace(/@import\s+["']https?:\/\/([^\"/]+)([^"']*)["']/gi, (match, host, path) => {
+        return `@import "https://${url.host}/${host}${path}"`
+      })
+      // 11. 相对路径（双引号）
+      .replace(/(href|src|action|data)="\/(?!\/)([^\"]*)"/gi, (match, attr, path) => {
         return `${attr}="/${targetDomain}/${path}"`
       })
-      // 4. url("/xxx") 补全为 /当前域名/xxx
-      .replace(/url\("\/(?!\/)([^\"]*)"\)/g, (match, path) => {
+      // 12. 相对路径（单引号）
+      .replace(/(href|src|action|data)='\/(?!\/)([^']*)'/gi, (match, attr, path) => {
+        return `${attr}='/${targetDomain}/${path}'`
+      })
+      // 13. CSS url() 相对路径
+      .replace(/url\(["']?\/(?!\/)([^\s)"']*)["']?\)/gi, (match, path) => {
         return `url("/${targetDomain}/${path}")`
       })
-      // 5. 插入 OpenWeb Proxy 动态代理JS钩子
-      .replace(/<\/body>/, `<script>${proxyInjection}</script></body>`)
+      // 14. srcset 属性（响应式图片）
+      .replace(/srcset="([^"]*)"/gi, (match, srcset) => {
+        const newSrcset = srcset.replace(/https?:\/\/([^\s,]+)/g, (m, hostpath) => {
+          return `https://${url.host}/${hostpath}`
+        }).replace(/\/\/([^\s,]+)/g, (m, hostpath) => {
+          return `https://${url.host}/${hostpath}`
+        }).replace(/\s\/([^\s,]+)/g, (m, path) => {
+          return ` /${targetDomain}/${path.trim()}`
+        })
+        return `srcset="${newSrcset}"`
+      })
+      // 15. meta refresh 重定向
+      .replace(/<meta([^>]*http-equiv=["']?refresh["']?[^>]*)>/gi, (match, attrs) => {
+        return match.replace(/url=([^\s;"'>]+)/gi, (m, metaUrl) => {
+          if(metaUrl.startsWith('http://') || metaUrl.startsWith('https://')){
+            const u = new URL(metaUrl)
+            return `url=https://${url.host}/${u.host}${u.pathname}${u.search}${u.hash}`
+          } else if(metaUrl.startsWith('//')){
+            return `url=https://${url.host}/${metaUrl.substring(2)}`
+          } else if(metaUrl.startsWith('/')){
+            return `url=/${targetDomain}${metaUrl}`
+          }
+          return m
+        })
+      })
+      // 16. 处理 <base> 标签（移除或重写）
+      .replace(/<base\s+href=["']([^"']+)["'][^>]*>/gi, '')
+      // 17. 插入 JS 钩子（优先在 <head> 末尾，否则 <body> 开头）
+      .replace(/<\/head>/i, `<script>${proxyInjection}</script></head>`)
+      .replace(/<body([^>]*)>/i, (match, attrs) => {
+        if(html.includes('</head>')) return match
+        return `<body${attrs}><script>${proxyInjection}</script>`
+      })
 
     return new Response(modifiedHtml, {
       status: response.status,
-      headers: response.headers,
+      headers: newResponseHeaders,
     })
   }
 
-  // 如果不是 HTML 响应，直接返回原始响应
-  return response
+  // 如果是 CSS 响应，也需要处理 url()
+  if (contentType && (contentType.includes('text/css') || contentType.includes('application/css'))) {
+    const css = await responseClone.text()
+    const modifiedCss = css
+      .replace(/url\(["']?https?:\/\/([^\s)"']+)["']?\)/gi, (match, hostpath) => {
+        return `url("https://${url.host}/${hostpath}")`
+      })
+      .replace(/url\(["']?\/\/([^\s)"']+)["']?\)/gi, (match, hostpath) => {
+        return `url("https://${url.host}/${hostpath}")`
+      })
+      .replace(/url\(["']?\/(?!\/)([^\s)"']*)["']?\)/gi, (match, path) => {
+        return `url("/${targetDomain}/${path}")`
+      })
+      .replace(/@import\s+["']https?:\/\/([^\s"']+)["']/gi, (match, hostpath) => {
+        return `@import "https://${url.host}/${hostpath}"`
+      })
+    
+    return new Response(modifiedCss, {
+      status: response.status,
+      headers: newResponseHeaders,
+    })
+  }
+
+  // 其他响应直接返回，但使用修改后的响应头
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newResponseHeaders,
+  })
 }
 
-// ui
+// 返回索引页面的 HTML 内容
 function indexHtml() {
   return `
 <!DOCTYPE html>

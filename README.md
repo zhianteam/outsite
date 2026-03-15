@@ -1,6 +1,6 @@
 # 跨站网络加速
 
-部署在 Cloudflare Workers 上的反向代理服务，通过将目标网站的请求转发到 Worker，实现对被限制网站的访问加速。内置动态 JS 钩子，自动将页面内的所有链接、请求重写为代理路径，保证页面内跳转和动态请求也能正常走代理。
+部署在 Cloudflare Workers 上的增强型反向代理服务，通过将目标网站的请求转发到 Worker，实现对被限制网站的访问加速。内置深度 JS 钩子和智能 URL 重写，自动处理页面内的所有链接、动态请求、CSS 资源，保证页面内跳转和动态请求也能正常走代理。
 
 ---
 
@@ -12,13 +12,15 @@
     ▼
 Cloudflare Worker（你的域名）
     │  重写请求头 Host
+    │  移除 CSP / X-Frame-Options
     ▼
 目标网站（如 www.google.com）
     │
     ▼
 Worker 处理响应
-    │  HTML：替换所有链接 + 注入 JS 钩子
-    │  非 HTML：直接透传
+    │  HTML：17 种正则替换 + 注入增强 JS 钩子
+    │  CSS：重写 url() 和 @import
+    │  其他：透传（带修改后的响应头）
     ▼
 用户浏览器
 ```
@@ -32,7 +34,7 @@ Worker 支持两种路径格式：
 | 格式 | 示例 | 说明 |
 |------|------|------|
 | `/域名/路径` | `/www.google.com/search?q=test` | 默认使用 HTTPS |
-| `/协议//域名/路径` | `/https//www.google.com/search` | 显式指定协议 |
+| `/协议//域名/路径` | `/https//example.com/path` | 显式指定协议 |
 
 访问根路径 `/` 返回内置的使用引导页面。
 
@@ -77,43 +79,116 @@ https://你的worker域名/https//example.com/path?query=1
 
 ## 技术细节
 
-### HTML 响应处理
+### 响应头处理
 
-Worker 对 HTML 页面做以下处理：
+自动移除或修改以下响应头，绕过浏览器安全限制：
 
-1. `href/src/action` 中的绝对链接 → 重写为代理路径
-2. `//host/path` 协议相对链接 → 重写为代理路径
-3. CSS `url("https://...")` → 重写为代理路径
-4. 以 `/` 开头的相对链接 → 补全为 `/目标域名/路径`
-5. 在 `</body>` 前注入动态 JS 钩子
+- 移除 `Content-Security-Policy`（绕过 CSP 限制，允许注入脚本）
+- 移除 `Content-Security-Policy-Report-Only`
+- 移除 `X-Frame-Options`（允许被 iframe 嵌入）
+- 添加 `Access-Control-Allow-Origin: *`（解决跨域问题）
 
-### JS 钩子劫持范围
+### HTML 响应处理（17 种正则替换）
+
+| 序号 | 处理内容 | 示例 |
+|------|----------|------|
+| 1 | 双引号绝对链接 | `href="https://example.com"` |
+| 2 | 单引号绝对链接 | `src='https://example.com'` |
+| 3 | 无引号绝对链接 | `href=https://example.com` |
+| 4-5 | 协议相对链接 | `src="//cdn.example.com"` |
+| 6-8 | CSS `url()` 各种引号 | `url("https://...")` |
+| 9 | CSS 协议相对 | `url(//cdn.example.com)` |
+| 10 | CSS `@import` | `@import "https://..."` |
+| 11-12 | 相对路径 | `href="/path"` |
+| 13 | CSS 相对路径 | `url("/path")` |
+| 14 | `srcset` 响应式图片 | `srcset="img.jpg 1x, img@2x.jpg 2x"` |
+| 15 | `<meta refresh>` 重定向 | `<meta http-equiv="refresh" content="0;url=...">` |
+| 16 | 移除 `<base>` 标签 | 避免基础 URL 冲突 |
+| 17 | 注入 JS 钩子 | 优先在 `<head>` 末尾，否则 `<body>` 开头 |
+
+### CSS 响应处理
+
+单独处理 CSS 文件（`text/css` / `application/css`），重写：
+
+- `url()` 中的绝对、协议相对、相对路径
+- `@import` 语句
+
+### JS 钩子劫持范围（增强版）
 
 注入的脚本会在页面运行时劫持以下 API，确保动态产生的请求也走代理：
 
+**网络请求**
 - `window.fetch`
 - `XMLHttpRequest.prototype.open`
-- `window.open`
-- `HTMLElement.prototype.setAttribute`（`src` / `href`）
+
+**DOM 操作**
+- `HTMLElement.prototype.setAttribute`（`src` / `href` / `action`）
 - `Node.prototype.appendChild`
+- `Node.prototype.insertBefore`（新增）
+- `Node.prototype.replaceChild`（新增）
+
+**动态 HTML**
+- `Element.prototype.innerHTML`（新增）
+- `Element.prototype.outerHTML`（新增）
+- `document.write`（新增）
+- `document.writeln`（新增）
+
+**导航**
+- `window.open`
 - `location.assign` / `location.replace` / `location.href`
 - `history.pushState` / `history.replaceState`
 
-内置防无限重定向保护（最多 5 次重定向后停止）。
+**自动修复**
+- `MutationObserver`（新增）—— 监听 DOM 变化，自动修复新插入的元素
 
-### 非 HTML 响应
+**安全机制**
+- 防重复注入检测
+- 防无限重定向保护（最多 5 次）
+- 过滤特殊协议（`data:`、`mailto:`、`javascript:`、`about:` 等）
 
-图片、JS、CSS、字体、JSON 等非 HTML 内容直接透传，不做任何修改。
+---
+
+## 兼容性提升
+
+相比基础版本，增强版新增：
+
+- 支持单引号、无引号属性
+- 支持 `srcset` 响应式图片
+- 支持 `<meta refresh>` 重定向
+- 支持 CSS 文件独立处理
+- 支持 `innerHTML`/`outerHTML` 动态 HTML
+- 支持 `document.write` 写入
+- 支持 `MutationObserver` 自动修复
+- 移除 CSP 和 X-Frame-Options 限制
 
 ---
 
 ## 限制与注意事项
 
-- **WebSocket** 不支持（Cloudflare Workers 免费版限制）
+- **WebSocket** 不支持（Cloudflare Workers 限制）
 - **部分网站** 有 Cloudflare 检测或 IP 封锁，可能无法正常代理
-- **Service Worker / PWA** 类网站可能因 JS 沙箱限制无法完整运行
+- **Service Worker / PWA** 类网站可能因沙箱限制无法完整运行
 - Cloudflare Workers 免费版每天有 **10 万次请求**限额，超出后需升级付费计划
 - 本工具仅供学习和合法用途，请遵守当地法律法规
+
+---
+
+## 更新日志
+
+**v2.0（增强版）**
+- 新增 17 种正则替换规则，覆盖更多 URL 格式
+- 新增 CSS 文件独立处理
+- 新增响应头安全限制移除（CSP、X-Frame-Options）
+- JS 钩子新增 `innerHTML`、`outerHTML`、`document.write` 劫持
+- JS 钩子新增 `insertBefore`、`replaceChild` 劫持
+- JS 钩子新增 `MutationObserver` 自动修复
+- 修复 `location.href` getter 返回值错误
+- 新增 `action` 属性处理（表单提交）
+
+**v1.0（基础版）**
+- 基础反向代理功能
+- 5 种正则替换
+- 基础 JS 钩子劫持
 
 ---
 
