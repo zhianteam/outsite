@@ -83,21 +83,16 @@ https://你的worker域名/https//example.com/path?query=1
 
 自动移除或修改以下响应头，绕过浏览器安全限制：
 
-- **智能移除** `Content-Security-Policy`（检测到 Cloudflare 验证页面时保留，避免验证失败）
+- 移除 `Content-Security-Policy`（绕过 CSP 限制，允许注入脚本）
 - 移除 `Content-Security-Policy-Report-Only`
 - 移除 `X-Frame-Options`（允许被 iframe 嵌入）
 - 添加 `Access-Control-Allow-Origin: *`（解决跨域问题）
+- 移除 Cloudflare 身份暴露头（`CF-Connecting-IP`、`CF-Ray`、`CF-Visitor`）
 
-**Cloudflare 验证检测机制**：
-- 检查响应头 `cf-mitigated` 或 `cf-chl-bypass`
-- 检查页面内容是否包含 `challenges.cloudflare.com`
-- 验证页面保留原始 CSP，确保验证脚本正常加载
-
-### HTML 响应处理（18 种正则替换）
+### HTML 响应处理（17 种正则替换）
 
 | 序号 | 处理内容 | 示例 |
 |------|----------|------|
-| 0 | 保护 Cloudflare 验证 URL | `challenges.cloudflare.com` |
 | 1 | 双引号绝对链接 | `href="https://example.com"` |
 | 2 | 单引号绝对链接 | `src='https://example.com'` |
 | 3 | 无引号绝对链接 | `href=https://example.com` |
@@ -111,7 +106,6 @@ https://你的worker域名/https//example.com/path?query=1
 | 15 | `<meta refresh>` 重定向 | `<meta http-equiv="refresh" content="0;url=...">` |
 | 16 | 移除 `<base>` 标签 | 避免基础 URL 冲突 |
 | 17 | 注入 JS 钩子 | 优先在 `<head>` 末尾，否则 `<body>` 开头 |
-| 18 | 恢复被保护的 URL | 还原 Cloudflare 验证 URL |
 
 ### CSS 响应处理
 
@@ -152,7 +146,7 @@ https://你的worker域名/https//example.com/path?query=1
 - 防重复注入检测
 - 防无限重定向保护（最多 5 次）
 - 过滤特殊协议（`data:`、`mailto:`、`javascript:`、`about:` 等）
-- **Cloudflare 验证白名单**（`challenges.cloudflare.com`、`/cdn-cgi/` 不代理）
+- 属性重定义保护（避免 `Cannot redefine property` 错误）
 
 ---
 
@@ -167,31 +161,31 @@ https://你的worker域名/https//example.com/path?query=1
 - 支持 `innerHTML`/`outerHTML` 动态 HTML
 - 支持 `document.write` 写入
 - 支持 `MutationObserver` 自动修复
-- 智能移除 CSP（保留 Cloudflare 验证页面的 CSP）
-- **Cloudflare 验证白名单**（解决验证页面无法显示的问题）
+- 移除 CSP 和 X-Frame-Options 限制
+- 增加属性重定义保护（try-catch）
 
 ---
 
 ## 限制与注意事项
 
 - **WebSocket** 不支持（Cloudflare Workers 限制）
-- **部分网站** 有 Cloudflare 检测或 IP 封锁，可能无法正常代理
+- **Cloudflare Turnstile / Challenge 验证** 不支持（验证机制会检测代理环境，无法绕过）
+- **部分网站** 有强反代理检测或 IP 封锁，可能无法正常代理
 - **Service Worker / PWA** 类网站可能因沙箱限制无法完整运行
 - Cloudflare Workers 免费版每天有 **10 万次请求**限额，超出后需升级付费计划
 - 本工具仅供学习和合法用途，请遵守当地法律法规
+
+**不支持的网站类型**：
+- 使用 Cloudflare Turnstile 验证的网站（如 Cloudflare Dashboard、部分受保护的网站）
+- 使用强反爬虫/反代理检测的网站
+- 需要 WebSocket 实时通信的网站
 
 ---
 
 ## 更新日志
 
-**260315-dev3（验证修复版）**
-- 修复 Cloudflare 验证页面无法显示的问题
-- 新增 Cloudflare 验证域名白名单（`challenges.cloudflare.com`、`/cdn-cgi/`）
-- 智能检测验证页面，保留其 CSP 响应头
-- 正则替换新增保护机制，避免破坏验证 URL
-
-**260315-dev2（增强版）**
-- 新增 17 种正则替换规则，覆盖更多 URL 格式
+**260315-dev2（当前版本）**
+- 新增 18 种正则替换规则，覆盖更多 URL 格式
 - 新增 CSS 文件独立处理
 - 新增响应头安全限制移除（CSP、X-Frame-Options）
 - JS 钩子新增 `innerHTML`、`outerHTML`、`document.write` 劫持
@@ -199,6 +193,7 @@ https://你的worker域名/https//example.com/path?query=1
 - JS 钩子新增 `MutationObserver` 自动修复
 - 修复 `location.href` getter 返回值错误
 - 新增 `action` 属性处理（表单提交）
+- 新增 `location.href` 和 `innerHTML` 重复定义保护（try-catch）
 
 **260315-dev1（基础版）**
 - 基础反向代理功能

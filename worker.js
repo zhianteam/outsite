@@ -1,6 +1,6 @@
 /**
  * 跨站网络加速 - Cloudflare Workers 反向代理
- * @version 260315-dev3
+ * @version 260315-dev2
  * @description 增强型反向代理，支持深度 JS 钩子和智能 URL 重写
  * @author 致安团队 (Zhian Team)
  * @license GPL-3.0
@@ -39,12 +39,21 @@ async function handleRequest(request) {
     targetDomain = pathSegments[1];
     targetPath = pathSegments.slice(2).join('/');
   }
+  
   // 构造目标 URL
   const targetUrl = `${targetProtocol}//${targetDomain}/${targetPath}${url.search}`;
 
   // 修改请求头，设置目标域名
   const newRequestHeaders = new Headers(request.headers)
   newRequestHeaders.set('Host', targetDomain)
+  // 移除可能暴露代理身份的请求头
+  newRequestHeaders.delete('CF-Connecting-IP')
+  newRequestHeaders.delete('CF-Ray')
+  newRequestHeaders.delete('CF-Visitor')
+  // 伪装 User-Agent（如果没有）
+  if(!newRequestHeaders.has('User-Agent')){
+    newRequestHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+  }
 
   // 转发请求到目标网站
   const response = await fetch(targetUrl, {
@@ -59,23 +68,14 @@ async function handleRequest(request) {
 
   // 移除限制性响应头
   const newResponseHeaders = new Headers(response.headers)
-  // 只在非 Cloudflare 验证页面时移除 CSP（保留验证页面的 CSP）
-  const isChallengeResponse = response.headers.get('cf-mitigated') || 
-                               response.headers.get('cf-chl-bypass') ||
-                               (contentType && contentType.includes('text/html') && 
-                                (await responseClone.clone().text()).includes('challenges.cloudflare.com'))
-  
-  if (!isChallengeResponse) {
-    newResponseHeaders.delete('Content-Security-Policy')
-    newResponseHeaders.delete('Content-Security-Policy-Report-Only')
-  }
+  newResponseHeaders.delete('Content-Security-Policy')
+  newResponseHeaders.delete('Content-Security-Policy-Report-Only')
   newResponseHeaders.delete('X-Frame-Options')
   newResponseHeaders.set('Access-Control-Allow-Origin', '*')
 
   // 如果是 HTML 响应，对内容进行修改
   if (contentType && contentType.includes('text/html')) {
     const html = await responseClone.text()
-    // 修改所有以 http:// 或 https:// 开头的链接，以及所有以 / 开头的相对链接
     // OpenWeb Proxy核心JS钩子（增强版）
     const proxyInjection = `
     (function(){
@@ -92,8 +92,6 @@ async function handleRequest(request) {
           if(!url||typeof url!=='string') return url;
           // 特殊协议直接放行
           if(url.startsWith('data:')||url.startsWith('mailto:')||url.startsWith('javascript:')||url.startsWith('chrome')||url.startsWith('edge')||url.startsWith('about:')) return url;
-          // Cloudflare 验证相关域名白名单（不代理）
-          if(url.includes('challenges.cloudflare.com')||url.includes('cloudflare.com/cdn-cgi/')||url.includes('/cdn-cgi/challenge')) return url;
           // 已经是代理路径，不再处理
           if(url.startsWith(window.location.origin+'/')) return url;
           // 协议相对链接补全
@@ -183,16 +181,24 @@ async function handleRequest(request) {
       };
       
       // innerHTML / outerHTML
-      const origInnerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
-      Object.defineProperty(Element.prototype, 'innerHTML', {
-        set: function(html){ origInnerHTMLDesc.set.call(this, processHTML(html)); },
-        get: function(){ return origInnerHTMLDesc.get.call(this); }
-      });
-      const origOuterHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
-      Object.defineProperty(Element.prototype, 'outerHTML', {
-        set: function(html){ origOuterHTMLDesc.set.call(this, processHTML(html)); },
-        get: function(){ return origOuterHTMLDesc.get.call(this); }
-      });
+      try{
+        const origInnerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+        if(origInnerHTMLDesc && origInnerHTMLDesc.configurable){
+          Object.defineProperty(Element.prototype, 'innerHTML', {
+            set: function(html){ origInnerHTMLDesc.set.call(this, processHTML(html)); },
+            get: function(){ return origInnerHTMLDesc.get.call(this); },
+            configurable: true
+          });
+        }
+        const origOuterHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
+        if(origOuterHTMLDesc && origOuterHTMLDesc.configurable){
+          Object.defineProperty(Element.prototype, 'outerHTML', {
+            set: function(html){ origOuterHTMLDesc.set.call(this, processHTML(html)); },
+            get: function(){ return origOuterHTMLDesc.get.call(this); },
+            configurable: true
+          });
+        }
+      }catch(e){ console.warn('Failed to hook innerHTML/outerHTML:', e); }
       
       // document.write / writeln
       const origWrite = document.write;
@@ -205,11 +211,18 @@ async function handleRequest(request) {
       window.location.assign = function(url){ origAssign.call(window.location, changeURL(url)); };
       const origReplace = window.location.replace;
       window.location.replace = function(url){ origReplace.call(window.location, changeURL(url)); };
-      const origHrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-      Object.defineProperty(window.location, 'href', {
-        set: function(url){ origHrefDesc.set.call(window.location, changeURL(url)); },
-        get: function(){ return origHrefDesc.get.call(window.location); }
-      });
+      
+      // 安全地劫持 location.href（避免重复定义错误）
+      try{
+        const origHrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+        if(origHrefDesc && origHrefDesc.configurable){
+          Object.defineProperty(window.location, 'href', {
+            set: function(url){ origHrefDesc.set.call(window.location, changeURL(url)); },
+            get: function(){ return origHrefDesc.get.call(window.location); },
+            configurable: true
+          });
+        }
+      }catch(e){ console.warn('Failed to hook location.href:', e); }
       
       // history
       const origPush = history.pushState;
@@ -247,11 +260,8 @@ async function handleRequest(request) {
     })();
     `;
     const modifiedHtml = html
-      // 0. 保护 Cloudflare 验证相关的 URL（不替换）
-      .replace(/(challenges\.cloudflare\.com|cloudflare\.com\/cdn-cgi\/)/g, '__CF_PROTECTED__$1')
       // 1. 双引号属性：绝对链接
       .replace(/(href|src|action|data)="https?:\/\/([^\"/]+)([^\"]*)"/gi, (match, attr, host, path) => {
-        if(host.includes('__CF_PROTECTED__')) return match.replace(/__CF_PROTECTED__/g, '')
         return `${attr}="https://${url.host}/${host}${path}"`
       })
       // 2. 单引号属性：绝对链接
@@ -335,8 +345,6 @@ async function handleRequest(request) {
         if(html.includes('</head>')) return match
         return `<body${attrs}><script>${proxyInjection}</script>`
       })
-      // 18. 恢复被保护的 Cloudflare URL
-      .replace(/__CF_PROTECTED__/g, '')
 
     return new Response(modifiedHtml, {
       status: response.status,
