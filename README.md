@@ -83,15 +83,21 @@ https://你的worker域名/https//example.com/path?query=1
 
 自动移除或修改以下响应头，绕过浏览器安全限制：
 
-- 移除 `Content-Security-Policy`（绕过 CSP 限制，允许注入脚本）
+- **智能移除** `Content-Security-Policy`（检测到 Cloudflare 验证页面时保留，避免验证失败）
 - 移除 `Content-Security-Policy-Report-Only`
 - 移除 `X-Frame-Options`（允许被 iframe 嵌入）
 - 添加 `Access-Control-Allow-Origin: *`（解决跨域问题）
 
-### HTML 响应处理（17 种正则替换）
+**Cloudflare 验证检测机制**：
+- 检查响应头 `cf-mitigated` 或 `cf-chl-bypass`
+- 检查页面内容是否包含 `challenges.cloudflare.com`
+- 验证页面保留原始 CSP，确保验证脚本正常加载
+
+### HTML 响应处理（18 种正则替换）
 
 | 序号 | 处理内容 | 示例 |
 |------|----------|------|
+| 0 | 保护 Cloudflare 验证 URL | `challenges.cloudflare.com` |
 | 1 | 双引号绝对链接 | `href="https://example.com"` |
 | 2 | 单引号绝对链接 | `src='https://example.com'` |
 | 3 | 无引号绝对链接 | `href=https://example.com` |
@@ -105,6 +111,7 @@ https://你的worker域名/https//example.com/path?query=1
 | 15 | `<meta refresh>` 重定向 | `<meta http-equiv="refresh" content="0;url=...">` |
 | 16 | 移除 `<base>` 标签 | 避免基础 URL 冲突 |
 | 17 | 注入 JS 钩子 | 优先在 `<head>` 末尾，否则 `<body>` 开头 |
+| 18 | 恢复被保护的 URL | 还原 Cloudflare 验证 URL |
 
 ### CSS 响应处理
 
@@ -145,6 +152,7 @@ https://你的worker域名/https//example.com/path?query=1
 - 防重复注入检测
 - 防无限重定向保护（最多 5 次）
 - 过滤特殊协议（`data:`、`mailto:`、`javascript:`、`about:` 等）
+- **Cloudflare 验证白名单**（`challenges.cloudflare.com`、`/cdn-cgi/` 不代理）
 
 ---
 
@@ -159,7 +167,8 @@ https://你的worker域名/https//example.com/path?query=1
 - 支持 `innerHTML`/`outerHTML` 动态 HTML
 - 支持 `document.write` 写入
 - 支持 `MutationObserver` 自动修复
-- 移除 CSP 和 X-Frame-Options 限制
+- 智能移除 CSP（保留 Cloudflare 验证页面的 CSP）
+- **Cloudflare 验证白名单**（解决验证页面无法显示的问题）
 
 ---
 
@@ -175,7 +184,13 @@ https://你的worker域名/https//example.com/path?query=1
 
 ## 更新日志
 
-**v260315-dev2（增强版）**
+**260315-dev3（验证修复版）**
+- 修复 Cloudflare 验证页面无法显示的问题
+- 新增 Cloudflare 验证域名白名单（`challenges.cloudflare.com`、`/cdn-cgi/`）
+- 智能检测验证页面，保留其 CSP 响应头
+- 正则替换新增保护机制，避免破坏验证 URL
+
+**260315-dev2（增强版）**
 - 新增 17 种正则替换规则，覆盖更多 URL 格式
 - 新增 CSS 文件独立处理
 - 新增响应头安全限制移除（CSP、X-Frame-Options）
@@ -185,7 +200,7 @@ https://你的worker域名/https//example.com/path?query=1
 - 修复 `location.href` getter 返回值错误
 - 新增 `action` 属性处理（表单提交）
 
-**v260314-dev1（基础版）**
+**260315-dev1（基础版）**
 - 基础反向代理功能
 - 5 种正则替换
 - 基础 JS 钩子劫持

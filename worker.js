@@ -1,3 +1,11 @@
+/**
+ * 跨站网络加速 - Cloudflare Workers 反向代理
+ * @version 260315-dev3
+ * @description 增强型反向代理，支持深度 JS 钩子和智能 URL 重写
+ * @author 致安团队 (Zhian Team)
+ * @license GPL-3.0
+ */
+
 addEventListener('fetch', (event) => {
   event.respondWith(handleRequest(event.request))
 })
@@ -51,8 +59,16 @@ async function handleRequest(request) {
 
   // 移除限制性响应头
   const newResponseHeaders = new Headers(response.headers)
-  newResponseHeaders.delete('Content-Security-Policy')
-  newResponseHeaders.delete('Content-Security-Policy-Report-Only')
+  // 只在非 Cloudflare 验证页面时移除 CSP（保留验证页面的 CSP）
+  const isChallengeResponse = response.headers.get('cf-mitigated') || 
+                               response.headers.get('cf-chl-bypass') ||
+                               (contentType && contentType.includes('text/html') && 
+                                (await responseClone.clone().text()).includes('challenges.cloudflare.com'))
+  
+  if (!isChallengeResponse) {
+    newResponseHeaders.delete('Content-Security-Policy')
+    newResponseHeaders.delete('Content-Security-Policy-Report-Only')
+  }
   newResponseHeaders.delete('X-Frame-Options')
   newResponseHeaders.set('Access-Control-Allow-Origin', '*')
 
@@ -74,8 +90,13 @@ async function handleRequest(request) {
       function changeURL(url){
         try{
           if(!url||typeof url!=='string') return url;
+          // 特殊协议直接放行
           if(url.startsWith('data:')||url.startsWith('mailto:')||url.startsWith('javascript:')||url.startsWith('chrome')||url.startsWith('edge')||url.startsWith('about:')) return url;
+          // Cloudflare 验证相关域名白名单（不代理）
+          if(url.includes('challenges.cloudflare.com')||url.includes('cloudflare.com/cdn-cgi/')||url.includes('/cdn-cgi/challenge')) return url;
+          // 已经是代理路径，不再处理
           if(url.startsWith(window.location.origin+'/')) return url;
+          // 协议相对链接补全
           if(url.startsWith('//')) url = window.location.protocol + url;
           let u = new URL(url, window.location.href);
           // 只代理http/https且不是本地
@@ -226,8 +247,11 @@ async function handleRequest(request) {
     })();
     `;
     const modifiedHtml = html
+      // 0. 保护 Cloudflare 验证相关的 URL（不替换）
+      .replace(/(challenges\.cloudflare\.com|cloudflare\.com\/cdn-cgi\/)/g, '__CF_PROTECTED__$1')
       // 1. 双引号属性：绝对链接
       .replace(/(href|src|action|data)="https?:\/\/([^\"/]+)([^\"]*)"/gi, (match, attr, host, path) => {
+        if(host.includes('__CF_PROTECTED__')) return match.replace(/__CF_PROTECTED__/g, '')
         return `${attr}="https://${url.host}/${host}${path}"`
       })
       // 2. 单引号属性：绝对链接
@@ -311,6 +335,8 @@ async function handleRequest(request) {
         if(html.includes('</head>')) return match
         return `<body${attrs}><script>${proxyInjection}</script>`
       })
+      // 18. 恢复被保护的 Cloudflare URL
+      .replace(/__CF_PROTECTED__/g, '')
 
     return new Response(modifiedHtml, {
       status: response.status,
